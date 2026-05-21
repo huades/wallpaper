@@ -25,6 +25,7 @@ except ImportError:
 
 
 SPI_SETDESKWALLPAPER = 20
+SPI_GETDESKWALLPAPER = 0x0073
 SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -32,6 +33,7 @@ APP_NAME = "TinyWallpaperChanger"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 SLIDESHOW_PID_FILE = ".slideshow.pid"
 SLIDESHOW_STOP_FILE = ".slideshow.stop"
+SLIDESHOW_STATE_FILE = ".slideshow_state.json"
 SLIDESHOW_LOG_FILE = "slideshow.log"
 DOWNLOAD_HISTORY_FILE = "download_history.json"
 PREFETCH_DIR = "prefetch"
@@ -82,15 +84,14 @@ class WallpaperChangerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.base_dir = Path(__file__).resolve().parent
-        self.download_dir = self.base_dir / "downloads"
         self.favorites_dir = self.base_dir / "favorites"
         self.prefetch_dir = self.base_dir / PREFETCH_DIR
         self.slideshow_pid_file = self.base_dir / SLIDESHOW_PID_FILE
         self.slideshow_stop_file = self.base_dir / SLIDESHOW_STOP_FILE
+        self.slideshow_state_file = self.base_dir / SLIDESHOW_STATE_FILE
         self.download_history_file = self.base_dir / DOWNLOAD_HISTORY_FILE
         self.prefetch_state_file = self.base_dir / PREFETCH_STATE_FILE
         self.settings_file = self.base_dir / SETTINGS_FILE
-        self.download_dir.mkdir(exist_ok=True)
         self.favorites_dir.mkdir(exist_ok=True)
         self.prefetch_dir.mkdir(exist_ok=True)
         self.trim_runtime_files()
@@ -98,13 +99,13 @@ class WallpaperChangerApp:
         self.sync_prefetch_state()
 
         self.current_file: Optional[Path] = None
-        self.downloaded_files: set[Path] = set()
         self.favorited_files: set[Path] = set()
         self.session_previewed_files: set[Path] = set()
         self.history: list[Path] = []
         self.history_index = -1
         self.slideshow_running = self.is_slideshow_running()
         self.slideshow_index = -1
+        self.slideshow_restart_job: Optional[str] = None
         self.state_lock = threading.Lock()
         self.status_queue: Queue[str] = Queue()
         self.stop_prefetch_event = threading.Event()
@@ -119,6 +120,8 @@ class WallpaperChangerApp:
         self.cache_size_var = tk.StringVar(value=str(settings["cache_limit_mb"]))
         self.autostart_var = tk.BooleanVar(value=self.is_autostart_enabled())
         self.status_var = tk.StringVar(value="选择分类后点击 ▶")
+        if self.slideshow_running:
+            self.restore_slideshow_position()
 
         self.build_ui()
         self.refresh_nav_buttons()
@@ -306,7 +309,7 @@ class WallpaperChangerApp:
         label.grid(row=row, column=column, padx=1, pady=(0, 0))
 
     def next_wallpaper(self) -> None:
-        if self.is_slideshow_running():
+        if self.is_slideshow_mode():
             self.step_favorite_wallpaper(1)
             return
 
@@ -330,7 +333,7 @@ class WallpaperChangerApp:
             self.refresh_button_colors()
 
     def previous_wallpaper(self) -> None:
-        if self.is_slideshow_running():
+        if self.is_slideshow_mode():
             self.step_favorite_wallpaper(-1)
             return
 
@@ -356,7 +359,7 @@ class WallpaperChangerApp:
             self.refresh_button_colors()
 
     def favorite_current(self) -> None:
-        if self.is_slideshow_running() and (
+        if self.is_slideshow_mode() and (
             not self.current_file or not self.current_file.exists()
         ):
             if not self.pick_favorite_wallpaper(0, show_message=False):
@@ -385,12 +388,17 @@ class WallpaperChangerApp:
         if not self.current_file:
             return
 
-        targets = [self.favorites_dir / self.current_file.name]
-        if self.current_file.parent == self.favorites_dir:
-            targets.append(self.current_file)
+        was_slideshow = self.is_slideshow_mode()
+        old_favorites = self.favorite_files() if was_slideshow else []
+        old_index = self.favorite_index(old_favorites) if old_favorites else None
+        targets = {self.favorites_dir / self.current_file.name}
+        if self.is_path_under(self.current_file, self.favorites_dir):
+            targets.add(self.current_file)
 
         removed = False
         for target in targets:
+            if not self.is_path_under(target, self.favorites_dir):
+                continue
             try:
                 if target.exists():
                     target.unlink()
@@ -401,8 +409,39 @@ class WallpaperChangerApp:
 
         self.favorited_files.discard(self.current_file.resolve())
         self.update_prefetch_item(self.current_file, is_favorite=False)
+        if was_slideshow and removed:
+            self.switch_after_unfavorite(old_index)
+            return
         self.status_var.set("已取消收藏" if removed else "当前图片未收藏")
         self.refresh_button_colors()
+
+    def switch_after_unfavorite(self, old_index: Optional[int]) -> None:
+        favorites = self.favorite_files()
+        if not favorites:
+            self.current_file = None
+            self.slideshow_index = -1
+            self.clear_slideshow_state()
+            self.stop_slideshow(update_status=False)
+            self.status_var.set("已取消收藏\n收藏夹已空")
+            self.refresh_nav_buttons()
+            self.refresh_button_colors()
+            return
+
+        next_index = old_index if old_index is not None else self.slideshow_index
+        next_index = max(0, next_index) % len(favorites)
+        file_path = favorites[next_index]
+        try:
+            self.set_wallpaper_with_fade(file_path)
+            self.current_file = file_path
+            self.slideshow_index = next_index
+            self.save_slideshow_state(file_path, next_index)
+            self.status_var.set(f"已取消收藏\n切到 {file_path.name}")
+            self.reset_slideshow_timer()
+        except Exception as exc:
+            messagebox.showerror("错误", f"切换下一张收藏失败：{exc}")
+        finally:
+            self.refresh_nav_buttons()
+            self.refresh_button_colors()
 
     def toggle_autostart(self) -> None:
         try:
@@ -437,23 +476,11 @@ class WallpaperChangerApp:
             for path in self.favorites_dir.iterdir()
             if path.is_file() and path.suffix.lower() in IMAGE_EXTS
         }
-        candidates = [
-            path
-            for path in self.download_dir.iterdir()
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTS
-        ]
-
-        for file_path in candidates:
-            if file_path.name in favorite_names or file_path.resolve() in self.favorited_files:
-                continue
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-                    removed_count += 1
-            except Exception:
-                pass
 
         for file_path in list(self.session_previewed_files):
+            if not self.is_path_under(file_path, self.prefetch_dir):
+                self.session_previewed_files.discard(file_path)
+                continue
             if file_path.name in favorite_names or file_path in self.favorited_files:
                 continue
             try:
@@ -466,6 +493,14 @@ class WallpaperChangerApp:
                 pass
         return removed_count
 
+    @staticmethod
+    def is_path_under(path: Path, parent: Path) -> bool:
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except ValueError:
+            return False
+
     def push_history(self, file_path: Path) -> None:
         if self.history_index < len(self.history) - 1:
             self.history = self.history[: self.history_index + 1]
@@ -473,7 +508,9 @@ class WallpaperChangerApp:
         self.history_index = len(self.history) - 1
 
     def step_favorite_wallpaper(self, direction: int) -> None:
-        if not self.pick_favorite_wallpaper(direction, show_message=True):
+        if self.pick_favorite_wallpaper(direction, show_message=True):
+            self.reset_slideshow_timer()
+        else:
             self.status_var.set("收藏夹还没有壁纸")
 
     def pick_favorite_wallpaper(self, direction: int, show_message: bool) -> bool:
@@ -492,6 +529,7 @@ class WallpaperChangerApp:
             self.set_wallpaper_with_fade(file_path)
             self.current_file = file_path
             self.slideshow_index = next_index
+            self.save_slideshow_state(file_path, next_index)
             if show_message:
                 action = "收藏下一张" if direction >= 0 else "收藏上一张"
                 self.status_var.set(f"{action}\n{file_path.name}")
@@ -512,8 +550,65 @@ class WallpaperChangerApp:
 
         return None
 
+    def restore_slideshow_position(self) -> None:
+        favorites = self.favorite_files()
+        if not favorites:
+            return
+
+        state_name = ""
+        try:
+            data = json.loads(self.slideshow_state_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("file_name"), str):
+                state_name = data["file_name"]
+        except (OSError, json.JSONDecodeError):
+            state_name = ""
+
+        desktop_path = self.current_desktop_wallpaper()
+        for source_name, source_path in ((state_name, None), ("", desktop_path)):
+            for index, path in enumerate(favorites):
+                if source_name and path.name == source_name:
+                    self.current_file = path
+                    self.slideshow_index = index
+                    self.save_slideshow_state(path, index)
+                    return
+                if source_path and self.same_file_or_name(path, source_path):
+                    self.current_file = path
+                    self.slideshow_index = index
+                    self.save_slideshow_state(path, index)
+                    return
+
+    def save_slideshow_state(self, file_path: Path, index: int) -> None:
+        write_slideshow_state(self.base_dir, file_path, index)
+
+    def clear_slideshow_state(self) -> None:
+        self.slideshow_state_file.unlink(missing_ok=True)
+
+    @staticmethod
+    def same_file_or_name(left: Path, right: Path) -> bool:
+        try:
+            if left.resolve() == right.resolve():
+                return True
+        except OSError:
+            pass
+        return left.name == right.name
+
+    @staticmethod
+    def current_desktop_wallpaper() -> Optional[Path]:
+        if os.name != "nt":
+            return None
+        buffer = ctypes.create_unicode_buffer(1024)
+        result = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETDESKWALLPAPER,
+            len(buffer),
+            buffer,
+            0,
+        )
+        if not result or not buffer.value:
+            return None
+        return Path(buffer.value)
+
     def refresh_nav_buttons(self) -> None:
-        if self.is_slideshow_running():
+        if self.is_slideshow_mode():
             state = "normal" if self.favorite_files() else "disabled"
             self.prev_btn.config(state=state)
             return
@@ -557,13 +652,12 @@ class WallpaperChangerApp:
         )
 
     def on_interval_changed(self, _event: object = None) -> None:
-        if self.slideshow_running:
+        if self.is_slideshow_mode():
             self.restart_slideshow()
             self.status_var.set(f"轮播时间已改为：{self.interval_var.get()}")
 
     def toggle_slideshow(self) -> None:
-        self.slideshow_running = self.is_slideshow_running()
-        if self.slideshow_running:
+        if self.is_slideshow_mode():
             self.slideshow_running = False
             self.refresh_button_colors()
             self.root.update_idletasks()
@@ -574,7 +668,8 @@ class WallpaperChangerApp:
             self.root.update_idletasks()
             self.start_slideshow()
 
-    def start_slideshow(self) -> None:
+    def start_slideshow(self, reset_current: bool = True) -> None:
+        self.slideshow_restart_job = None
         favorites = self.favorite_files()
         if not favorites:
             self.slideshow_running = False
@@ -595,21 +690,35 @@ class WallpaperChangerApp:
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
 
+        command = [str(runner), str(Path(__file__).resolve()), "--slideshow-daemon", interval]
+        continue_from: Optional[str] = None
+        if not reset_current and self.current_file:
+            for index, path in enumerate(favorites):
+                if path.name == self.current_file.name:
+                    continue_from = path.name
+                    self.slideshow_index = index
+                    break
+        if continue_from:
+            command.extend(["--continue-from", continue_from])
+
         try:
             subprocess.Popen(
-                [str(runner), str(Path(__file__).resolve()), "--slideshow-daemon", interval],
+                command,
                 **kwargs,
             )
         finally:
             log_handle.close()
         self.slideshow_running = True
-        self.current_file = favorites[0]
-        self.slideshow_index = 0
+        if reset_current:
+            self.current_file = favorites[0]
+            self.slideshow_index = 0
+            self.save_slideshow_state(self.current_file, self.slideshow_index)
         self.status_var.set(f"后台轮播已开启：{self.interval_var.get()}")
         self.refresh_nav_buttons()
         self.refresh_button_colors()
 
     def stop_slideshow(self, update_status: bool) -> None:
+        self.cancel_slideshow_restart()
         self.slideshow_stop_file.write_text("stop", encoding="utf-8")
         self.slideshow_running = False
         if update_status:
@@ -617,13 +726,43 @@ class WallpaperChangerApp:
         self.refresh_button_colors()
 
     def restart_slideshow(self) -> None:
-        if not self.is_slideshow_running():
+        if not self.is_slideshow_mode():
             return
-        self.stop_slideshow(update_status=False)
-        self.root.after(1500, self.start_slideshow)
+        self.cancel_slideshow_restart()
+        self.slideshow_stop_file.write_text("stop", encoding="utf-8")
+        self.slideshow_running = True
+        self.refresh_button_colors()
+        self.slideshow_restart_job = self.root.after(
+            1500,
+            lambda: self.start_slideshow(reset_current=False),
+        )
+
+    def reset_slideshow_timer(self) -> None:
+        if not self.is_slideshow_mode():
+            return
+        self.cancel_slideshow_restart()
+        self.slideshow_stop_file.write_text("stop", encoding="utf-8")
+        self.slideshow_running = True
+        self.refresh_button_colors()
+        self.slideshow_restart_job = self.root.after(
+            1200,
+            lambda: self.start_slideshow(reset_current=False),
+        )
 
     def is_slideshow_running(self) -> bool:
         return self.slideshow_pid_file.exists() and not self.slideshow_stop_file.exists()
+
+    def is_slideshow_mode(self) -> bool:
+        return self.slideshow_running or self.is_slideshow_running()
+
+    def cancel_slideshow_restart(self) -> None:
+        if self.slideshow_restart_job is None:
+            return
+        try:
+            self.root.after_cancel(self.slideshow_restart_job)
+        except tk.TclError:
+            pass
+        self.slideshow_restart_job = None
 
     def favorite_files(self) -> list[Path]:
         return favorite_files_in(self.favorites_dir)
@@ -1177,19 +1316,9 @@ class WallpaperChangerApp:
             raise RuntimeError("；".join(errors) if errors else "所有图片源都不可用")
         return image_bytes, image_ext
 
-    def download_next_image(self, category_name: str) -> Path:
-        image_bytes, image_ext = self.download_image_bytes(category_name)
-        ts = int(time.time() * 1000)
-        safe_category = category_name.replace("/", "_").replace("\\", "_")
-        file_path = self.download_dir / f"{safe_category}_{ts}{image_ext}"
-        with open(file_path, "wb") as f:
-            f.write(image_bytes)
-        self.remember_download_hash(hashlib.sha256(image_bytes).hexdigest())
-        return file_path
-
     def existing_image_hashes(self) -> set[str]:
         hashes = self.load_download_history_hashes()
-        for folder in (self.download_dir, self.favorites_dir, self.prefetch_dir):
+        for folder in (self.favorites_dir, self.prefetch_dir):
             for path in folder.rglob("*"):
                 if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
                     continue
@@ -1202,7 +1331,7 @@ class WallpaperChangerApp:
     def sync_download_history(self) -> None:
         hashes = self.load_download_history_hashes()
         before = len(hashes)
-        for folder in (self.download_dir, self.favorites_dir, self.prefetch_dir):
+        for folder in (self.favorites_dir, self.prefetch_dir):
             for path in folder.rglob("*"):
                 if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
                     continue
@@ -1448,7 +1577,18 @@ def favorite_files_in(folder: Path) -> list[Path]:
     return sorted(files, key=lambda path: path.stat().st_mtime)
 
 
-def run_slideshow_daemon(interval_seconds: int) -> None:
+def write_slideshow_state(base_dir: Path, file_path: Path, index: int) -> None:
+    state_file = base_dir / SLIDESHOW_STATE_FILE
+    data = {
+        "file_name": file_path.name,
+        "path": str(file_path.resolve()),
+        "index": index,
+        "updated_at": time.time(),
+    }
+    state_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def run_slideshow_daemon(interval_seconds: int, continue_from: str = "") -> None:
     base_dir = Path(__file__).resolve().parent
     favorites_dir = base_dir / "favorites"
     pid_file = base_dir / SLIDESHOW_PID_FILE
@@ -1457,11 +1597,24 @@ def run_slideshow_daemon(interval_seconds: int) -> None:
 
     index = -1
     try:
+        if continue_from:
+            for _ in range(max(1, interval_seconds)):
+                if stop_file.exists():
+                    break
+                time.sleep(1)
+
         while not stop_file.exists():
             favorites = favorite_files_in(favorites_dir)
             if favorites:
+                if continue_from:
+                    for current_index, path in enumerate(favorites):
+                        if path.name == continue_from:
+                            index = current_index
+                            break
+                    continue_from = ""
                 index = (index + 1) % len(favorites)
                 WallpaperChangerApp.set_wallpaper(favorites[index])
+                write_slideshow_state(base_dir, favorites[index], index)
 
             for _ in range(max(1, interval_seconds)):
                 if stop_file.exists():
@@ -1473,7 +1626,10 @@ def run_slideshow_daemon(interval_seconds: int) -> None:
 
 def main() -> None:
     if len(sys.argv) >= 3 and sys.argv[1] == "--slideshow-daemon":
-        run_slideshow_daemon(int(sys.argv[2]))
+        continue_from = ""
+        if len(sys.argv) >= 5 and sys.argv[3] == "--continue-from":
+            continue_from = sys.argv[4]
+        run_slideshow_daemon(int(sys.argv[2]), continue_from)
         return
 
     root = tk.Tk()

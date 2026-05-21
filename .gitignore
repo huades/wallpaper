@@ -4,6 +4,7 @@ favorites/
 downloads/
 *.log
 .slideshow.*
+.slideshow_state.json
 download_history.json
 prefetch_state.json
 settings.json

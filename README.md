@@ -42,12 +42,11 @@ D:\Anaconda3\pythonw.exe
 
 优先从 wallhaven 下载；如果不可用，会自动尝试 Bing 每日壁纸和 picsum 备用源。
 
-下载前会检查 `download_history.json` 以及 `downloads`、`favorites`、`prefetch` 中已有图片的内容哈希，重复图片会自动跳过。即使未收藏图片关闭窗口后被删除，也会保留下载记录，避免下次重新下载同一张。
+下载前会检查 `download_history.json` 以及 `favorites`、`prefetch` 中已有图片的内容哈希，重复图片会自动跳过。即使未收藏图片关闭窗口后被删除，也会保留下载记录，避免下次重新下载同一张。
 
 ## 文件夹
 
 - `prefetch`：按分类保存后台预下载图片；未预览图片会保留，已预览未收藏图片关闭时删除。
-- `downloads`：旧版临时下载目录；仍会清理未收藏图片。
 - `favorites`：收藏目录。收藏的图片会保留，也会用于后台轮播。
 - `prefetch_state.json`：预下载缓存状态。
 - `settings.json`：缓存大小和上次分类设置，默认 `100MB` 和 `随机`。
