@@ -1,0 +1,9 @@
+__pycache__/
+prefetch/
+favorites/
+downloads/
+*.log
+.slideshow.*
+download_history.json
+prefetch_state.json
+settings.json
