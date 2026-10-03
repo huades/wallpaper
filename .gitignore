@@ -1,4 +1,17 @@
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+.pytest_cache/
+build/
+dist/
+*.egg-info/
 prefetch/
 favorites/
 downloads/

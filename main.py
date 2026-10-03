@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from queue import Empty, Queue
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -30,6 +31,7 @@ SPIF_UPDATEINIFILE = 0x01
 SPIF_SENDCHANGE = 0x02
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "TinyWallpaperChanger"
+GITHUB_REPOSITORY_URL = "https://github.com/huades/wallpaper"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 SLIDESHOW_PID_FILE = ".slideshow.pid"
 SLIDESHOW_STOP_FILE = ".slideshow.stop"
@@ -42,6 +44,8 @@ SETTINGS_FILE = "settings.json"
 MIN_CACHE_LIMIT_MB = 10
 MAX_CACHE_LIMIT_MB = 1024
 DEFAULT_CACHE_LIMIT_MB = 100
+DEFAULT_TRANSPARENCY_PERCENT = 30
+MAX_TRANSPARENCY_PERCENT = 70
 MAX_LOG_BYTES = 1024 * 1024
 DOWNLOAD_HISTORY_MAX_ITEMS = 5000
 DOWNLOAD_HISTORY_RETENTION_DAYS = 180
@@ -106,10 +110,13 @@ class WallpaperChangerApp:
         self.slideshow_running = self.is_slideshow_running()
         self.slideshow_index = -1
         self.slideshow_restart_job: Optional[str] = None
+        self.settings_dialog: Optional[tk.Toplevel] = None
         self.state_lock = threading.Lock()
         self.status_queue: Queue[str] = Queue()
         self.stop_prefetch_event = threading.Event()
         settings = self.load_settings()
+        self.window_alpha = 1 - int(settings["transparency_percent"]) / 100
+        self.root.attributes("-alpha", self.window_alpha)
         initial_category = str(settings.get("last_category", "随机"))
         if initial_category not in CATEGORIES:
             initial_category = "随机"
@@ -144,14 +151,41 @@ class WallpaperChangerApp:
         shell = tk.Frame(self.root, bg="#20252B")
         shell.place(x=8, y=5, width=304, height=120)
 
+        title_frame = tk.Frame(shell, bg="#20252B", height=24)
+        title_frame.pack(fill="x")
+        title_frame.pack_propagate(False)
+
         title = tk.Label(
-            shell,
+            title_frame,
             text="Wallpaper Changer",
             bg="#20252B",
             fg="#F5F7FA",
             font=("Segoe UI", 11, "bold"),
         )
-        title.pack(anchor="w")
+        title.pack(side="left")
+
+        icon = tk.PhotoImage(file=str(self.base_dir / "assets" / "github-mark.png"))
+        self.github_icon = icon.subsample(max(1, (icon.width() + 19) // 20))
+        self.github_btn = tk.Button(
+            title_frame,
+            name="github_repository",
+            image=self.github_icon,
+            text="GitHub repository",
+            compound="none",
+            takefocus=True,
+            command=lambda: webbrowser.open_new_tab(GITHUB_REPOSITORY_URL),
+            bg="#20252B",
+            activebackground="#475564",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#20252B",
+            highlightcolor="#51CF66",
+            cursor="hand2",
+            padx=2,
+            pady=1,
+        )
+        self.github_btn.pack(side="right")
+        self.add_repository_tooltip(self.github_btn)
 
         selector_frame = tk.Frame(shell, bg="#20252B")
         selector_frame.pack(fill="x", pady=(3, 3))
@@ -307,6 +341,42 @@ class WallpaperChangerApp:
             font=("Microsoft YaHei UI", 6),
         )
         label.grid(row=row, column=column, padx=1, pady=(0, 0))
+
+    def add_repository_tooltip(self, button: tk.Button) -> None:
+        tooltip: Optional[tk.Toplevel] = None
+
+        def show(_event: object) -> None:
+            nonlocal tooltip
+            if tooltip is not None:
+                return
+            button.configure(bg="#475564")
+            tooltip = tk.Toplevel(self.root)
+            tooltip.overrideredirect(True)
+            tooltip.attributes("-topmost", True)
+            tooltip.geometry(
+                f"+{button.winfo_rootx() - 95}+{button.winfo_rooty() + button.winfo_height() + 3}"
+            )
+            tk.Label(
+                tooltip,
+                text="GitHub repository",
+                bg="#171B20",
+                fg="#F5F7FA",
+                font=("Segoe UI", 8),
+                padx=6,
+                pady=3,
+            ).pack()
+
+        def hide(_event: object) -> None:
+            nonlocal tooltip
+            button.configure(bg="#20252B")
+            if tooltip is not None:
+                tooltip.destroy()
+                tooltip = None
+
+        button.bind("<Enter>", show)
+        button.bind("<Leave>", hide)
+        button.bind("<FocusIn>", show)
+        button.bind("<FocusOut>", hide)
 
     def next_wallpaper(self) -> None:
         if self.is_slideshow_mode():
@@ -780,12 +850,21 @@ class WallpaperChangerApp:
             self.status_var.set(f"已切换分类\n清理 {removed} 张")
 
     def open_settings(self) -> None:
+        if self.settings_dialog is not None and self.settings_dialog.winfo_exists():
+            self.settings_dialog.lift()
+            self.settings_dialog.focus_set()
+            return
+        saved_settings = self.load_settings()
+        self.cache_size_var.set(str(saved_settings["cache_limit_mb"]))
+        original_alpha = self.window_alpha
         dialog = tk.Toplevel(self.root)
+        self.settings_dialog = dialog
         dialog.title("设置")
-        dialog.geometry("230x125")
+        dialog.geometry("260x210")
         dialog.resizable(False, False)
         dialog.configure(bg="#20252B")
         dialog.transient(self.root)
+        dialog.attributes("-alpha", self.window_alpha)
         dialog.grab_set()
 
         label = tk.Label(
@@ -808,6 +887,50 @@ class WallpaperChangerApp:
         )
         size_entry.pack(anchor="w", padx=12)
 
+        transparency_var = tk.IntVar(value=round((1 - original_alpha) * 100))
+        transparency_label_var = tk.StringVar()
+        tk.Label(
+            dialog,
+            textvariable=transparency_label_var,
+            bg="#20252B",
+            fg="#C8D1DB",
+            font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w", padx=12, pady=(10, 0))
+
+        def preview_transparency(_value: str = "") -> None:
+            percent = transparency_var.get()
+            transparency_label_var.set(f"窗口透明度：{percent}%")
+            self.window_alpha = 1 - percent / 100
+            self.root.attributes("-alpha", self.window_alpha)
+            dialog.attributes("-alpha", self.window_alpha)
+
+        tk.Scale(
+            dialog,
+            variable=transparency_var,
+            from_=0,
+            to=MAX_TRANSPARENCY_PERCENT,
+            orient="horizontal",
+            command=preview_transparency,
+            showvalue=False,
+            resolution=1,
+            bg="#20252B",
+            fg="#C8D1DB",
+            troughcolor="#171B20",
+            highlightthickness=0,
+            bd=0,
+        ).pack(fill="x", padx=12)
+        preview_transparency()
+
+        def close_dialog() -> None:
+            self.window_alpha = original_alpha
+            self.root.attributes("-alpha", original_alpha)
+            self.cache_size_var.set(str(self.load_settings()["cache_limit_mb"]))
+            self.settings_dialog = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.bind("<Escape>", lambda _event: close_dialog())
+
         def save_and_close() -> None:
             try:
                 value = int(self.cache_size_var.get().strip())
@@ -820,9 +943,11 @@ class WallpaperChangerApp:
             self.cache_size_var.set(str(value))
             settings = self.load_settings()
             settings["cache_limit_mb"] = value
+            settings["transparency_percent"] = transparency_var.get()
             self.save_settings(settings)
             self.enforce_cache_limit()
             self.status_var.set(f"缓存上限：{value}MB\n{self.prefetch_status_text()}")
+            self.settings_dialog = None
             dialog.destroy()
 
         def open_prefetch_folder() -> None:
@@ -847,7 +972,7 @@ class WallpaperChangerApp:
         close_btn = tk.Button(
             action_frame,
             text="关闭",
-            command=dialog.destroy,
+            command=close_dialog,
             bg="#2F3843",
             fg="#F5F7FA",
             bd=0,
@@ -867,12 +992,13 @@ class WallpaperChangerApp:
             font=("Microsoft YaHei UI", 9),
         )
         ok_btn.grid(row=0, column=2)
-        self.center_child_window(dialog, 230, 125)
+        self.center_child_window(dialog, 260, 210)
 
     def load_settings(self) -> dict[str, object]:
         default: dict[str, object] = {
             "cache_limit_mb": DEFAULT_CACHE_LIMIT_MB,
             "last_category": "随机",
+            "transparency_percent": DEFAULT_TRANSPARENCY_PERCENT,
         }
         if not self.settings_file.exists():
             self.save_settings(default)
@@ -880,6 +1006,9 @@ class WallpaperChangerApp:
         try:
             data = json.loads(self.settings_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            self.save_settings(default)
+            return default
+        if not isinstance(data, dict):
             self.save_settings(default)
             return default
         try:
@@ -891,12 +1020,27 @@ class WallpaperChangerApp:
         last_category = str(data.get("last_category", "随机"))
         if last_category not in CATEGORIES:
             last_category = "随机"
-        return {"cache_limit_mb": int(limit), "last_category": last_category}
+        try:
+            transparency = int(
+                data.get("transparency_percent", DEFAULT_TRANSPARENCY_PERCENT)
+            )
+        except (TypeError, ValueError, OverflowError):
+            transparency = DEFAULT_TRANSPARENCY_PERCENT
+        if not 0 <= transparency <= MAX_TRANSPARENCY_PERCENT:
+            transparency = DEFAULT_TRANSPARENCY_PERCENT
+        return {
+            "cache_limit_mb": int(limit),
+            "last_category": last_category,
+            "transparency_percent": transparency,
+        }
 
     def save_settings(self, data: dict[str, object]) -> None:
         current = {
             "cache_limit_mb": int(data.get("cache_limit_mb", DEFAULT_CACHE_LIMIT_MB)),
             "last_category": str(data.get("last_category", "随机")),
+            "transparency_percent": int(
+                data.get("transparency_percent", DEFAULT_TRANSPARENCY_PERCENT)
+            ),
         }
         if current["last_category"] not in CATEGORIES:
             current["last_category"] = "随机"
@@ -914,8 +1058,8 @@ class WallpaperChangerApp:
         root_y = self.root.winfo_rooty()
         root_w = self.root.winfo_width()
         root_h = self.root.winfo_height()
-        x = root_x + max(0, (root_w - width) // 2)
-        y = root_y + max(0, (root_h - height) // 2)
+        x = root_x + (root_w - width) // 2
+        y = root_y + (root_h - height) // 2
         dialog.geometry(f"{width}x{height}+{x}+{y}")
 
     def start_prefetch_worker(self) -> None:
@@ -1479,11 +1623,12 @@ class WallpaperChangerApp:
             raise RuntimeError(f"下载失败：{exc}") from exc
 
     def set_wallpaper_with_fade(self, file_path: Path) -> None:
-        self.fade_window(self.window_alpha, 0.45)
+        fade_alpha = min(self.window_alpha, 0.45)
+        self.fade_window(self.window_alpha, fade_alpha)
         try:
             self.set_wallpaper(file_path)
         finally:
-            self.fade_window(0.45, self.window_alpha)
+            self.fade_window(fade_alpha, self.window_alpha)
 
     def fade_window(self, start: float, end: float) -> None:
         steps = 6
